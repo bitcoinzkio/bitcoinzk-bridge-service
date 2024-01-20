@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	ctmtypes "github.com/0xPolygonHermez/zkevm-bridge-service/claimtxman/types"
@@ -27,6 +28,7 @@ const (
 	mtHeight        = 32
 	cacheSize       = 1000
 	LeafTypeMessage = uint8(1)
+	txLimit         = 100
 )
 
 // ClaimTxManager is the claim transaction manager for L2.
@@ -45,6 +47,7 @@ type ClaimTxManager struct {
 	auth            *bind.TransactOpts
 	nonceCache      *lru.Cache[string, uint64]
 	synced          bool
+	nextNonceLock   sync.RWMutex
 }
 
 // NewClaimTxManager creates a new claim transaction manager.
@@ -79,7 +82,7 @@ func NewClaimTxManager(cfg Config, chExitRootEvent chan *etherman.GlobalExitRoot
 // send then to the blockchain and keep monitoring them until they
 // get mined
 func (tm *ClaimTxManager) Start() {
-	ticker := time.NewTicker(tm.cfg.FrequencyToMonitorTxs.Duration)
+	go tm.monitor()
 	for {
 		select {
 		case <-tm.ctx.Done():
@@ -101,6 +104,16 @@ func (tm *ClaimTxManager) Start() {
 			} else {
 				log.Infof("Waiting for networkID %d to be synced before processing deposits", tm.l2NetworkID)
 			}
+		}
+	}
+}
+
+func (tm *ClaimTxManager) monitor() {
+	ticker := time.NewTicker(tm.cfg.FrequencyToMonitorTxs.Duration)
+	for {
+		select {
+		case <-tm.ctx.Done():
+			return
 		case <-ticker.C:
 			err := tm.monitorTxs(tm.ctx)
 			if err != nil {
@@ -202,14 +215,20 @@ func (tm *ClaimTxManager) isDepositMessageAllowed(deposit *etherman.Deposit) boo
 	return false
 }
 
-func (tm *ClaimTxManager) getNextNonce(from common.Address) (uint64, error) {
+func (tm *ClaimTxManager) getNextNonce(from common.Address, add bool) (uint64, error) {
+	tm.nextNonceLock.Lock()
+	defer tm.nextNonceLock.Unlock()
+
 	nonce, err := tm.l2Node.NonceAt(tm.ctx, from, nil)
 	if err != nil {
 		return 0, err
 	}
-	if tempNonce, found := tm.nonceCache.Get(from.Hex()); found {
-		if tempNonce >= nonce {
-			nonce = tempNonce + 1
+
+	if add {
+		if tempNonce, found := tm.nonceCache.Get(from.Hex()); found {
+			if tempNonce >= nonce {
+				nonce = tempNonce + 1
+			}
 		}
 	}
 	tm.nonceCache.Add(from.Hex(), nonce)
@@ -235,7 +254,7 @@ func (tm *ClaimTxManager) addClaimTx(depositCount uint, from common.Address, to 
 		return nil
 	}
 	// get next nonce
-	nonce, err := tm.getNextNonce(from)
+	nonce, err := tm.getNextNonce(from, true)
 	if err != nil {
 		err := fmt.Errorf("failed to get current nonce: %v", err)
 		log.Errorf("error getting next nonce. Error: %s", err.Error())
@@ -268,7 +287,7 @@ func (tm *ClaimTxManager) monitorTxs(ctx context.Context) error {
 	}
 
 	statusesFilter := []ctmtypes.MonitoredTxStatus{ctmtypes.MonitoredTxStatusCreated}
-	mTxs, err := tm.storage.GetClaimTxsByStatus(ctx, statusesFilter, dbTx)
+	mTxs, err := tm.storage.GetClaimTxsByStatus(ctx, statusesFilter, dbTx, txLimit)
 	if err != nil {
 		log.Errorf("failed to get created monitored txs: %v", err)
 		rollbackErr := tm.storage.Rollback(tm.ctx, dbTx)
@@ -279,7 +298,6 @@ func (tm *ClaimTxManager) monitorTxs(ctx context.Context) error {
 		return fmt.Errorf("failed to get created monitored txs: %v", err)
 	}
 
-	isResetNonce := false // it will reset the nonce in one cycle
 	log.Infof("found %v monitored tx to process", len(mTxs))
 	for _, mTx := range mTxs {
 		mTx := mTx // force variable shadowing to avoid pointer conflicts
@@ -383,15 +401,17 @@ func (tm *ClaimTxManager) monitorTxs(ctx context.Context) error {
 			}
 
 			// GasPrice is set here to use always the proper and most accurate value right before sending it to L2
-			gasPrice, err := tm.l2Node.SuggestGasPrice(ctx)
+			mTx.GasPrice, err = tm.l2Node.SuggestGasPrice(ctx)
 			if err != nil {
 				mTxLog.Errorf("failed to get suggested gasPrice. Error: %v", err)
 				continue
 			}
-			//Multiply gasPrice by 10 to increase the efficiency of the tx in the sequence
-			mTx.GasPrice = big.NewInt(0).Mul(gasPrice, big.NewInt(10)) //nolint:gomnd
-			log.Infof("Using gasPrice: %s. The gasPrice suggested by the network is %s", mTx.GasPrice.String(), gasPrice.String())
-
+			nonce, err := tm.l2Node.NonceAt(tm.ctx, mTx.From, nil)
+			if err != nil {
+				mTxLog.Errorf("failed to get nonce. Error: %v", err)
+				continue
+			}
+			mTx.Nonce = nonce
 			// rebuild transaction
 			tx := mTx.Tx()
 			mTxLog.Debugf("unsigned tx created for monitored tx")
@@ -423,11 +443,6 @@ func (tm *ClaimTxManager) monitorTxs(ctx context.Context) error {
 					var reviewNonce bool
 					if strings.Contains(err.Error(), "nonce") {
 						mTxLog.Infof("nonce error detected, Nonce used: %d", signedTx.Nonce())
-						if !isResetNonce {
-							isResetNonce = true
-							tm.nonceCache.Remove(mTx.From.Hex())
-							mTxLog.Infof("nonce cache cleared for address %v", mTx.From.Hex())
-						}
 						reviewNonce = true
 					}
 					mTx.RemoveHistory(signedTx)
@@ -435,6 +450,13 @@ func (tm *ClaimTxManager) monitorTxs(ctx context.Context) error {
 					err := tm.ReviewMonitoredTx(ctx, &mTx, reviewNonce)
 					if err != nil {
 						mTxLog.Errorf("failed to review monitored tx: %v", err)
+					}
+				} else {
+					// Retry if the tx has not appeared in the pool yet.
+					for i := 0; i < tm.cfg.RetryNumber && err != nil; i++ {
+						mTxLog.Warn("waiting and retrying to find the tx in the pool. TxHash: %s. Error: %v", signedTx.Hash().String(), err)
+						time.Sleep(tm.cfg.RetryInterval.Duration)
+						_, _, err = tm.l2Node.TransactionByHash(ctx, signedTx.Hash())
 					}
 				}
 			} else if err != nil && !errors.Is(err, ethereum.NotFound) {
@@ -499,16 +521,13 @@ func (tm *ClaimTxManager) ReviewMonitoredTx(ctx context.Context, mTx *ctmtypes.M
 
 	if reviewNonce {
 		// check nonce
-		nonce, err := tm.getNextNonce(mTx.From)
+		nonce, err := tm.getNextNonce(mTx.From, false)
 		if err != nil {
 			err := fmt.Errorf("failed to get nonce: %w", err)
 			mTxLog.Errorf(err.Error())
 			return err
 		}
-		if nonce > mTx.Nonce {
-			mTxLog.Infof("monitored tx nonce updated from %v to %v", mTx.Nonce, nonce)
-			mTx.Nonce = nonce
-		}
+		mTx.Nonce = nonce
 	}
 
 	return nil
