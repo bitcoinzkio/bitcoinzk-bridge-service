@@ -153,3 +153,5 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	rsc.io/tmplfunc v0.0.3 // indirect
 )
+
+replace github.com/ethereum/go-ethereum v1.13.2 => github.com/bitcoinzkio/go-ethereum v0.0.0-20250828070145-e1690a893ea1
